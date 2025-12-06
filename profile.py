@@ -1,164 +1,145 @@
-# -*- coding: utf-8 -*-
 import geni.portal as portal
 import geni.rspec.pg as rspec
 
 # --- CONFIGURATION ---
 
-GITHUB_URL = "https://github.com/A1ex-Fu/vrpaxos.git"
-DESIRED_KERNEL = "5.8.0-050800-generic"
+# Using the URL with the token you provided in the prompt
+REPO_URL = "https://github.com/A1ex-Fu/vrpaxos.git"
+TARGET_KERNEL_VERSION = "5.8.0-050800-generic"
 
-# --- THE STATE MACHINE SCRIPT ---
-# This shell script runs on every boot. It checks what needs to be done.
-# We embed it here as a Python string to write it to the nodes later.
+# --- THE SETUP SCRIPT ---
+# This script handles: Kernel Update -> Reboot -> Dependencies -> Git Clone -> Setup
 SETUP_SCRIPT = r"""#!/bin/bash
-set -e # Exit on error
+set -e
 
-# Logs output to /local/setup.log for debugging
+# Redirect all output to log file for debugging
 exec > >(tee -a /local/setup.log) 2>&1
 
-ROLE=$1  # "client" or "replica" passed from profile
+echo "--- Setup Script Started at $(date) ---"
 
-echo "--- Starting Setup Driver ($(date)) ---"
-echo "Current Kernel: $(uname -r)"
+# 1. IDENTIFY USER
+# CloudLab mounts user homes in /users/. We pick the first non-root user.
+USER_NAME=$(ls /users | grep -v root | head -n 1)
+USER_HOME="/users/$USER_NAME"
+echo "Detected User: $USER_NAME"
+echo "User Home: $USER_HOME"
 
-# ==========================================================
-# PHASE 1: ALWAYS RUN (Network Configuration)
-# ==========================================================
-# Ensure experimental interface is named 'eth1' and multicast is ON.
-# This must run on every boot because /sys settings reset.
-
-# Find interface with 10.10.1.x IP
-EXP_IFACE=$(ip -o -4 addr list | grep '10.10.1' | awk '{print $2}')
-
-if [ -n "$EXP_IFACE" ]; then
-    if [ "$EXP_IFACE" != "eth1" ]; then
-        echo "Renaming $EXP_IFACE to eth1..."
-        sudo ip link set dev $EXP_IFACE down
-        sudo ip link set dev $EXP_IFACE name eth1
-        sudo ip link set dev eth1 up
-        EXP_IFACE="eth1"
-    fi
-    echo "Enabling Multicast on $EXP_IFACE..."
-    sudo ip link set dev $EXP_IFACE multicast on
-    sudo ip route add 224.0.0.0/4 dev $EXP_IFACE || echo "Route exists"
-else
-    echo "WARNING: Could not find interface with 10.10.1.x IP"
-fi
-
-# ==========================================================
-# PHASE 2: KERNEL UPDATE (Runs once)
-# ==========================================================
+# 2. CHECK KERNEL VERSION
 CURRENT_KERNEL=$(uname -r)
+DESIRED_KERNEL="{target_kernel}"
 
-if [[ "$CURRENT_KERNEL" != *"{target_kernel}"* ]]; then
-    echo "Kernel mismatch. Installing {target_kernel}..."
-    
-    # Download and install kernel
+if [[ "$CURRENT_KERNEL" != *"$DESIRED_KERNEL"* ]]; then
+    echo "Current kernel ($CURRENT_KERNEL) does not match desired ($DESIRED_KERNEL)."
+    echo "Installing Kernel 5.8.0..."
+
+    # Download and run the kernel script
     wget -N https://raw.githubusercontent.com/pimlie/ubuntu-mainline-kernel.sh/master/ubuntu-mainline-kernel.sh
     chmod +x ubuntu-mainline-kernel.sh
-    # Non-interactive install
     sudo bash ubuntu-mainline-kernel.sh -i 5.8.0 --yes
+
+    # Set GRUB to boot this kernel
+    echo "Updating GRUB default..."
+    # We grab the menu entry ID for the 5.8 kernel
+    GRUB_ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux $DESIRED_KERNEL"
+    sudo grub-set-default "$GRUB_ENTRY"
     
-    echo "Updating GRUB..."
-    sudo grub-set-default "Ubuntu, with Linux {target_kernel}"
-    
-    echo "Rebooting in 5 seconds to apply kernel..."
-    sleep 5
+    # Ensure it sticks
+    sudo update-grub
+
+    echo "Rebooting node to apply kernel..."
+    # Create a marker so we know we attempted a reboot
+    touch /local/kernel_rebooted
     sudo reboot
-    exit 0 # Script stops here, system reboots
+    
+    # Script stops here due to reboot
+    exit 0
 fi
 
-echo "Kernel is correct."
+echo "Kernel is correct: $CURRENT_KERNEL"
 
-# ==========================================================
-# PHASE 3: DEPENDENCIES & REPO (Runs once after reboot)
-# ==========================================================
-if [ ! -f /local/setup_complete_marker ]; then
+# 3. INSTALL DEPENDENCIES (Run as Root)
+if [ ! -f /local/dependencies_installed ]; then
     echo "Installing Dependencies..."
     export DEBIAN_FRONTEND=noninteractive
-    sudo apt update
-    sudo apt install -y llvm clang gpg curl tar xz-utils make gcc flex bison \
+    sudo apt-get update
+    sudo apt-get install -y llvm clang gpg curl tar xz-utils make gcc flex bison \
         libssl-dev libelf-dev protobuf-compiler pkg-config libunwind-dev \
         libssl-dev libprotobuf-dev libevent-dev libgtest-dev
 
-    echo "Cloning Repository..."
-    # Remove existing dir if it exists to be safe
-    rm -rf /users/$(whoami)/vrpaxos
-    git clone {github_url} /users/$(whoami)/vrpaxos
+    touch /local/dependencies_installed
+else
+    echo "Dependencies already installed."
+fi
 
-    cd /users/$(whoami)/vrpaxos
+# 4. CLONE REPO & PREP (Run as User)
+REPO_DIR="$USER_HOME/vrpaxos"
+
+if [ ! -d "$REPO_DIR" ]; then
+    echo "Cloning Repository into $REPO_DIR..."
+    
+    # IMPORTANT: Run git as the user, not root!
+    sudo -u $USER_NAME git clone {repo_url} $REPO_DIR
     
     echo "Running Kernel Prep Scripts..."
+    cd $REPO_DIR
+    
+    # Run the prep scripts as the user so permissions stay correct
     if [ -f kernel-src-download.sh ]; then
-        bash kernel-src-download.sh
-        bash kernel-src-prepare.sh
-    else
-        echo "Warning: kernel-src scripts not found in repo."
+        echo "Running kernel-src-download.sh..."
+        sudo -u $USER_NAME bash kernel-src-download.sh
+    fi
+    
+    if [ -f kernel-src-prepare.sh ]; then
+        echo "Running kernel-src-prepare.sh..."
+        sudo -u $USER_NAME bash kernel-src-prepare.sh
     fi
 
-    # Mark this phase as done so we don't re-run apt/git on next boot
-    touch /local/setup_complete_marker
+    echo "Repository Setup Complete."
 else
-    echo "Dependencies and Repo already setup."
+    echo "Repository directory already exists at $REPO_DIR"
 fi
 
-# ==========================================================
-# PHASE 4: APPLICATION STARTUP
-# ==========================================================
-# Run the specific client/replica scripts provided in the repository
-if [ "$ROLE" == "client" ]; then
-    echo "Starting Client Setup..."
-    if [ -f /local/repository/setup_client.sh ]; then
-        bash /local/repository/setup_client.sh
-    fi
-else
-    echo "Starting Replica Setup..."
-    if [ -f /local/repository/setup_replica.sh ]; then
-        bash /local/repository/setup_replica.sh
-    fi
-fi
+echo "--- Setup Driver Finished Successfully at $(date) ---"
+""".format(target_kernel=TARGET_KERNEL_VERSION, repo_url=REPO_URL)
 
-echo "Setup Driver Finished Successfully."
-""".replace("{target_kernel}", DESIRED_KERNEL).replace("{github_url}", GITHUB_URL)
 
+# --- GENILIB DEFINITION ---
 
 pc = portal.Context()
 request = pc.makeRequestRSpec()
-IMAGE = 'urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU20-64-STD'
-NUM_NODES = 4
 
+# Standard Ubuntu Image
+IMAGE = 'urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU20-64-STD'
+
+# Define LAN
 lan = request.LAN("lan")
 lan.bandwidth = 25600000 
+
+NUM_NODES = 4
 
 for i in range(NUM_NODES):
     node = request.RawPC("node-{}".format(i+1))
     node.disk_image = IMAGE
-
+    
     # Networking
     iface = node.addInterface("if1")
     iface.addAddress(rspec.IPv4Address("10.10.1.{}".format(i+1), "255.255.255.0"))
     lan.addInterface(iface)
 
-    # Determine Role
-    role = "client" if i == 0 else "replica"
-
-    # --- INJECTION SEQUENCE ---
-    # 1. Write the script to the node
-    # 2. Add it to Crontab @reboot so it survives the kernel update reboot
-    # 3. Execute it manually the first time to kick off the process
+    # --- SETUP SERVICE ---
+    # We write the script to /local/startup.sh and run it on every boot
+    # The script itself handles the logic of "do I need to reboot?" or "am I done?"
     
-    cmd_write = "cat << 'EOF' > /local/setup_driver.sh\n{}\nEOF".format(SETUP_SCRIPT)
-    cmd_chmod = "chmod +x /local/setup_driver.sh"
-    cmd_cron  = "(crontab -l 2>/dev/null; echo '@reboot /local/setup_driver.sh {}') | crontab -".format(role)
-    cmd_start = "/local/setup_driver.sh {} &".format(role) # Run in background so CloudLab doesn't hang waiting
-
-    # Chain commands into one addService to ensure order
-    full_cmd = "{} && {} && {} && {}".format(cmd_write, cmd_chmod, cmd_cron, cmd_start)
+    cmd_write = "cat << 'EOF' > /local/startup.sh\n{}\nEOF".format(SETUP_SCRIPT)
+    cmd_chmod = "chmod +x /local/startup.sh"
+    # Run immediately in background
+    cmd_run   = "nohup /local/startup.sh &" 
     
+    # Add to rc.local or crontab to ensure it runs after the reboot
+    cmd_persist = "(crontab -l 2>/dev/null; echo '@reboot /local/startup.sh') | crontab -"
+
+    full_cmd = "{} && {} && {} && {}".format(cmd_write, cmd_chmod, cmd_persist, cmd_run)
+
     node.addService(rspec.Execute(shell="bash", command=full_cmd))
-
-    # Standard tuning
-    node.addService(rspec.Execute(shell="sh", command="echo 1 > /sys/bus/workqueue/devices/writeback/cpumask"))
-    node.addService(rspec.Execute(shell="sh", command="systemctl disable irqbalance"))
 
 pc.printRequestRSpec(request)
