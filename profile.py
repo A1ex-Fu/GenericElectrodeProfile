@@ -3,6 +3,8 @@ import geni.portal as portal
 import geni.rspec.pg as rspec
 
 # --- CONFIGURATION ---
+
+GITHUB_URL = "https://github.com/A1ex-Fu/vrpaxos.git"
 DESIRED_KERNEL = "5.8.0-050800-generic"
 
 # --- THE STATE MACHINE SCRIPT ---
