@@ -22,7 +22,7 @@ lan = request.LAN("lan")
 # Set bandwidth to 25 Gbps (25,000,000 Kbps).
 # Note: r320 nodes have 40Gbps physical links. 
 # CloudLab will enforce this 25Gbps limit via software traffic shaping.
-lan.bandwidth = 25000000 
+# lan.bandwidth = 25000000 
 
 # Create the nodes and add them to the LAN.
 for i in range(NUM_NODES):
